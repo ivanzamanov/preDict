@@ -93,7 +93,8 @@ public class PreDict {
 	// A DictionaryItem is used for word, word/delete, and delete with multiple
 	// suggestions. Int is used for deletes with a single suggestion (the
 	// majority of entries).
-	private final HashMap<String, Object> dictionary = new HashMap<String, Object>();
+	private final HashMap<String, Object> dictionary = new HashMap<>();
+	private long totalTermCount = 0;
 
 	// List of unique words. By using the suggestions (int) as index for this
 	// list they are translated into the original String.
@@ -101,10 +102,14 @@ public class PreDict {
 
 	private int maxlength = 0; // maximum dictionary term length
 
-
 	public boolean indexWord(String word) {
+		return indexWord(word, 1);
+	}
+
+	public boolean indexWord(String word, int frequency) {
 		word = customizing.cleanIndexWord(word);
-		DictionaryItem value = appendToDictionary(word);
+		maxlength = Math.max(maxlength, word.length());
+		DictionaryItem value = appendToDictionary(word, frequency);
 
 		// edits/suggestions are created only once, no matter how often a word
 		// occurs. they are created only as soon as the word occurs in the
@@ -118,7 +123,8 @@ public class PreDict {
 		return true;
 	}
 
-	private DictionaryItem appendToDictionary(String word) {
+	private DictionaryItem appendToDictionary(String word, int frequency) {
+		frequency = Math.abs(frequency);
 		DictionaryItem value;
 		Object dictionaryEntry = dictionary.get(word);
 
@@ -132,7 +138,11 @@ public class PreDict {
 			}
 
 			// prevent overflow
-			if (value.count < Integer.MAX_VALUE) value.count++;
+			if(value.count + frequency < value.count) {
+				value.count = Integer.MAX_VALUE;
+			} else {
+				value.count += frequency;
+			}
 		}
 		// this is a new word
 		else if (wordlist.size() < Integer.MAX_VALUE) {
@@ -143,6 +153,11 @@ public class PreDict {
 		} else {
 			throw new IllegalStateException("can not index word since wordlist reached limit of Integer.MAX_VALUE");
 		}
+
+		if(!(totalTermCount + frequency < totalTermCount)) {
+			totalTermCount += frequency;
+		}
+
 		return value;
 	}
 
@@ -229,10 +244,8 @@ public class PreDict {
 
 	public List<String> findSimilarWords(String searchQuery) {
 		List<SuggestItem> suggestions = lookup(searchQuery, editDistanceMax);
-		
-		List<String> similarWords = new ArrayList<>();
+		List<String> similarWords = new ArrayList<>(suggestions.size());
 		suggestions.forEach(suggestion -> similarWords.add(suggestion.term));
-		
 		return similarWords;
 	}
 
@@ -241,13 +254,13 @@ public class PreDict {
 
 		// save some time
 		if (cleanedSearchWord.length() - editDistanceMax > maxlength)
-			return new ArrayList<SuggestItem>();
+			return new ArrayList<>();
 
-		List<String> candidates = new ArrayList<String>();
-		HashSet<String> candidatesUniq = new HashSet<String>();
+		List<String> candidates = new ArrayList<>();
+		HashSet<String> candidatesUniq = new HashSet<>();
 
-		List<SuggestItem> suggestions = new ArrayList<SuggestItem>();
-		HashSet<String> checkedWords = new HashSet<String>();
+		List<SuggestItem> suggestions = new ArrayList<>();
+		HashSet<String> checkedWords = new HashSet<>();
 
 		Object dictionaryEntry;
 
@@ -289,8 +302,9 @@ public class PreDict {
 							suggestions.add(si);
 						}
 						// early termination
-						if ((accuracyLevel.ordinal() < 2) && (cleanedSearchWord.length() - candidate.length() == 0))
+						if ((accuracyLevel.ordinal() < 2) && (cleanedSearchWord.length() - candidate.length() == 0)) {
 							break nosort;
+						}
 					}
 
 					// iterate through suggestions (to other correct dictionary
@@ -432,7 +446,7 @@ public class PreDict {
 		} else {
 			returnSuggestions = Ordering.from(distanceCountComparator).leastOf(suggestions, k);
 		}
-		
+
 		return customizing.adjustFinalResult(searchWord, returnSuggestions);
 	}
 
@@ -453,7 +467,7 @@ public class PreDict {
 				* (isDelete ? fromString.length() - toString.length() : toString.length() - fromString.length());
 	}
 
-	private double cxpDamerauLevenshtein(String a, String b) {
+	public double cxpDamerauLevenshtein(String a, String b) {
 		double[][] d = new double[b.length() + 1][a.length() + 1]; // 2d matrix
 
 		// Step 1
@@ -498,12 +512,107 @@ public class PreDict {
 		return d[b.length()][a.length()];
 	}
 
-	private double min(double a, double b, double c) {
+	private static double min(double a, double b, double c) {
 		return Math.min(a, Math.min(b, c));
 	}
 
 	@Override
 	public String toString() {
 		return "PreDict "+customizing.toString();
+	}
+
+	public static final class SegmentationResult {
+		public String segmentedString;
+		public String correctedString;
+		double distanceSum;
+		double probabilityLogSum;
+
+		public SegmentationResult(String part, String topResult, double distanceSum, double logProbabilitySum) {
+			this.segmentedString = part;
+			this.correctedString = topResult;
+			this.distanceSum = distanceSum;
+			this.probabilityLogSum = logProbabilitySum;
+		}
+	}
+
+	public SegmentationResult segment(String input, int maxEditDistance, int maxSegmentLength) {
+		int arraySize = Math.min(maxSegmentLength, input.length());
+		SegmentationResult[] compositions = new SegmentationResult[arraySize];
+		int circularIndex = -1;
+
+		//outer loop (column): all possible part start positions
+		for (int j = 0; j < input.length(); j++) {
+			//inner loop (row): all possible part lengths (from start position): part can't be bigger than longest word in dictionary (other than long unknown word)
+			for (int i = 1; i <= Math.min(input.length() - j, maxSegmentLength); i++) {
+				//get top spelling correction/ed for part
+				String part = input.substring(j, j + i);
+				double separatorWeight = 0;
+				double correctionDist = 0;
+				double correctionProb = 0;
+				String segmentCorrection = "";
+
+				if (Character.isWhitespace(part.charAt(0))) {
+					//remove space for levenshtein calculation
+					part = part.substring(1);
+				} else {
+					//add ed+1: space did not exist, had to be inserted
+					separatorWeight = this.insertionWeight;
+				}
+
+				//remove space from part1, add number of removed spaces to topEd
+				int spacesRemoved = part.length();
+				//remove space
+				part = part.replaceAll(" ", "");
+				//add number of removed spaces to ed
+				spacesRemoved = spacesRemoved - part.length();
+				correctionDist = spacesRemoved * this.deletionWeight;
+
+				List<SuggestItem> results = this.lookup(part, maxEditDistance);
+				if (!results.isEmpty()) {
+					segmentCorrection = results.get(0).term;
+					correctionDist += results.get(0).distance;
+					//Naive Bayes Rule
+					//we assume the word probabilities of two words to be independent
+					//therefore the resulting probability of the word combination is the product of the two word probabilities
+
+					//instead of computing the product of probabilities we are computing the sum of the logarithm of probabilities
+					//because the probabilities of words are about 10^-10, the product of many such small numbers could exceed (underflow) the floating number range and become zero
+					//log(ab)=log(a)+log(b)
+					correctionProb = Math.log10((double) results.get(0).count / this.totalTermCount);
+				} else {
+					segmentCorrection = part;
+					//default, if word not found
+					//otherwise long input text would win as long unknown word (with ed=edmax+1 ), although there there should many spaces inserted
+					correctionDist += part.length() * this.insertionWeight;
+					correctionProb = Math.log10(10.0 / (this.totalTermCount * Math.pow(10.0, part.length())));
+				}
+
+				int destinationIndex = (circularIndex + i) % arraySize;
+
+				//set values in first loop
+				if (j == 0) {
+					compositions[destinationIndex] = new SegmentationResult(part, segmentCorrection, correctionDist, correctionProb);
+				} else if (
+						(i == maxSegmentLength)
+						//replace values if better probabilityLogSum, if same edit distance OR one space difference
+						|| (
+							((compositions[circularIndex].distanceSum + correctionDist == compositions[destinationIndex].distanceSum)
+								|| (compositions[circularIndex].distanceSum + separatorWeight + correctionDist == compositions[destinationIndex].distanceSum))
+							&& (compositions[destinationIndex].probabilityLogSum < compositions[circularIndex].probabilityLogSum + correctionProb))
+						//replace values if smaller edit distance
+						|| (compositions[circularIndex].distanceSum + separatorWeight + correctionDist < compositions[destinationIndex].distanceSum)
+						) {
+					compositions[destinationIndex] = new SegmentationResult(
+							compositions[circularIndex].segmentedString + " " + part,
+							compositions[circularIndex].correctedString + " " + segmentCorrection,
+							compositions[circularIndex].distanceSum + separatorWeight + correctionDist,
+							compositions[circularIndex].probabilityLogSum + correctionProb
+					);
+				}
+			}
+
+			circularIndex = (circularIndex + 1) % arraySize;
+		}
+		return compositions[circularIndex];
 	}
 }
